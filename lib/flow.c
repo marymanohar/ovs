@@ -868,11 +868,6 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
         }
 
         tc_flow = get_16aligned_be32(&nh->ip6_flow);
-        {
-            ovs_be32 label = tc_flow & htonl(IPV6_LABEL_MASK);
-            miniflow_push_be32(mf, ipv6_label, label);
-        }
-
         nw_tos = ntohl(tc_flow) >> 20;
         nw_ttl = nh->ip6_hlim;
         nw_proto = nh->ip6_nxt;
@@ -880,6 +875,12 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
         if (!parse_ipv6_ext_hdrs__(&data, &size, &nw_proto, &nw_frag)) {
             goto out;
         }
+
+        /* This needs to be after the parse_ipv6_ext_hdrs__() call because it
+         * leaves the nw_frag word uninitialized. */
+        ASSERT_SEQUENTIAL(ipv6_label, nw_frag);
+        ovs_be32 label = tc_flow & htonl(IPV6_LABEL_MASK);
+        miniflow_push_be32(mf, ipv6_label, label);
     } else {
         if (dl_type == htons(ETH_TYPE_ARP) ||
             dl_type == htons(ETH_TYPE_RARP)) {
@@ -1019,6 +1020,11 @@ parse_dl_type(const struct eth_header *data_, size_t size)
     return parse_ethertype(&data, &size);
 }
 
+/* Parses and return the TCP flags in 'packet', converted to host byte order.
+ * If 'packet' is not an Ethernet packet embedding TCP, returns 0.
+ *
+ * The caller must ensure that 'packet' is at least ETH_HEADER_LEN bytes
+ * long.'*/
 uint16_t
 parse_tcp_flags(struct dp_packet *packet)
 {
@@ -2301,6 +2307,37 @@ flow_hash_symmetric_l3l4(const struct flow *flow, uint32_t basis,
     return hash_finish(hash, basis);
 }
 
+/* Hashes 'flow' based on its nw_dst and nw_src for multipath. */
+uint32_t
+flow_hash_symmetric_l3(const struct flow *flow, uint32_t basis)
+{
+    struct {
+        union {
+            ovs_be32 ipv4_addr;
+            struct in6_addr ipv6_addr;
+        };
+        ovs_be16 eth_type;
+    } fields;
+
+    int i;
+
+    memset(&fields, 0, sizeof fields);
+    fields.eth_type = flow->dl_type;
+
+    if (fields.eth_type == htons(ETH_TYPE_IP)) {
+        fields.ipv4_addr = flow->nw_src ^ flow->nw_dst;
+    } else if (fields.eth_type == htons(ETH_TYPE_IPV6)) {
+        const uint8_t *a = &flow->ipv6_src.s6_addr[0];
+        const uint8_t *b = &flow->ipv6_dst.s6_addr[0];
+        uint8_t *ipv6_addr = &fields.ipv6_addr.s6_addr[0];
+
+        for (i = 0; i < 16; i++) {
+            ipv6_addr[i] = a[i] ^ b[i];
+        }
+    }
+    return jhash_bytes(&fields, sizeof fields, basis);
+}
+
 /* Initialize a flow with random fields that matter for nx_hash_fields. */
 void
 flow_random_hash_fields(struct flow *flow)
@@ -2416,6 +2453,16 @@ flow_mask_hash_fields(const struct flow *flow, struct flow_wildcards *wc,
         }
         break;
 
+    case NX_HASH_FIELDS_SYMMETRIC_L3:
+        if (flow->dl_type == htons(ETH_TYPE_IP)) {
+            memset(&wc->masks.nw_src, 0xff, sizeof wc->masks.nw_src);
+            memset(&wc->masks.nw_dst, 0xff, sizeof wc->masks.nw_dst);
+        } else if (flow->dl_type == htons(ETH_TYPE_IPV6)) {
+            memset(&wc->masks.ipv6_src, 0xff, sizeof wc->masks.ipv6_src);
+            memset(&wc->masks.ipv6_dst, 0xff, sizeof wc->masks.ipv6_dst);
+        }
+        break;
+
     default:
         OVS_NOT_REACHED();
     }
@@ -2458,6 +2505,8 @@ flow_hash_fields(const struct flow *flow, enum nx_hash_fields fields,
             return basis;
         }
 
+    case NX_HASH_FIELDS_SYMMETRIC_L3:
+        return flow_hash_symmetric_l3(flow, basis);
     }
 
     OVS_NOT_REACHED();
@@ -2474,6 +2523,7 @@ flow_hash_fields_to_str(enum nx_hash_fields fields)
     case NX_HASH_FIELDS_SYMMETRIC_L3L4_UDP: return "symmetric_l3l4+udp";
     case NX_HASH_FIELDS_NW_SRC: return "nw_src";
     case NX_HASH_FIELDS_NW_DST: return "nw_dst";
+    case NX_HASH_FIELDS_SYMMETRIC_L3: return "symmetric_l3";
     default: return "<unknown>";
     }
 }
@@ -2487,7 +2537,8 @@ flow_hash_fields_valid(enum nx_hash_fields fields)
         || fields == NX_HASH_FIELDS_SYMMETRIC_L3L4
         || fields == NX_HASH_FIELDS_SYMMETRIC_L3L4_UDP
         || fields == NX_HASH_FIELDS_NW_SRC
-        || fields == NX_HASH_FIELDS_NW_DST;
+        || fields == NX_HASH_FIELDS_NW_DST
+        || fields == NX_HASH_FIELDS_SYMMETRIC_L3;
 }
 
 /* Returns a hash value for the bits of 'flow' that are active based on
@@ -2520,14 +2571,14 @@ flow_hash_in_wildcards(const struct flow *flow,
  *
  *      - Other values of 'vid' should not be used. */
 void
-flow_set_dl_vlan(struct flow *flow, ovs_be16 vid)
+flow_set_dl_vlan(struct flow *flow, ovs_be16 vid, int id)
 {
     if (vid == htons(OFP10_VLAN_NONE)) {
-        flow->vlans[0].tci = htons(0);
+        flow->vlans[id].tci = htons(0);
     } else {
         vid &= htons(VLAN_VID_MASK);
-        flow->vlans[0].tci &= ~htons(VLAN_VID_MASK);
-        flow->vlans[0].tci |= htons(VLAN_CFI) | vid;
+        flow->vlans[id].tci &= ~htons(VLAN_VID_MASK);
+        flow->vlans[id].tci |= htons(VLAN_CFI) | vid;
     }
 }
 
@@ -2560,11 +2611,11 @@ flow_set_vlan_vid(struct flow *flow, ovs_be16 vid)
  * After calling this function, 'flow' will not match packets without a VLAN
  * header. */
 void
-flow_set_vlan_pcp(struct flow *flow, uint8_t pcp)
+flow_set_vlan_pcp(struct flow *flow, uint8_t pcp, int id)
 {
     pcp &= 0x07;
-    flow->vlans[0].tci &= ~htons(VLAN_PCP_MASK);
-    flow->vlans[0].tci |= htons((pcp << VLAN_PCP_SHIFT) | VLAN_CFI);
+    flow->vlans[id].tci &= ~htons(VLAN_PCP_MASK);
+    flow->vlans[id].tci |= htons((pcp << VLAN_PCP_SHIFT) | VLAN_CFI);
 }
 
 /* Counts the number of VLAN headers. */

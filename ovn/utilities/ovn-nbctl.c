@@ -3404,6 +3404,7 @@ static void
 nbctl_lr_policy_add(struct ctl_context *ctx)
 {
     const struct nbrec_logical_router *lr;
+    int64_t priority = 0;
 
     char *error = lr_by_name_or_uuid(ctx, ctx->argv[1], true, &lr);
     if (error) {
@@ -3411,27 +3412,25 @@ nbctl_lr_policy_add(struct ctl_context *ctx)
         return;
     }
 
-    if (ctx->argc >= 5) {
-       VLOG_INFO("nbctl_lr_policy_add: priority %s match %s action %s",
-         ctx->argv[2], ctx->argv[3], ctx->argv[4]);
-    } else {
-       ctl_fatal("insufficient parameters");
+    error = parse_priority(ctx->argv[2], &priority);
+    if (error) {
+        ctx->error = error;
+        return;
     }
 
-    int64_t priority = parse_priority(ctx->argv[2]);
     const char *action = ctx->argv[4];
     char *next_hop = NULL;
 
     /* Validate action. */
     if (strcmp(action, "allow") && strcmp(action, "drop")
         && strcmp(action, "reroute")) {
-        ctl_fatal("%s: action must be one of \"allow\", \"drop\", "
+        ctl_error(ctx, "%s: action must be one of \"allow\", \"drop\", "
                   "and \"reroute\"", action);
     }
 
     if (!strcmp(action, "reroute")) {
         if (ctx->argc < 6) {
-            ctl_fatal("Nexthop is not specified when action is reroute.");
+            ctl_error(ctx, "Nexthop is not specified when action is reroute.");
         }
     }
 
@@ -3441,8 +3440,15 @@ nbctl_lr_policy_add(struct ctl_context *ctx)
         const struct nbrec_logical_router_policy *policy = lr->policies[i];
         if ((policy->priority == priority) &&
             (!strcmp(policy->match, ctx->argv[3]))) {
-           ctl_fatal("Same routing policy already existed on the "
+           ctl_error(ctx, "Same routing policy already existed on the "
                        " logical router %s.", ctx->argv[1]);
+        }
+    }
+
+    if (ctx->argc == 6) {
+        next_hop = normalize_prefix_str(ctx->argv[5]);
+        if (!next_hop) {
+            ctl_error(ctx, "bad next hop argument: %s", ctx->argv[5]);
         }
     }
 
@@ -3452,10 +3458,6 @@ nbctl_lr_policy_add(struct ctl_context *ctx)
     nbrec_logical_router_policy_set_match(policy, ctx->argv[3]);
     nbrec_logical_router_policy_set_action(policy, action);
     if (ctx->argc == 6) {
-        next_hop = normalize_prefix_str(ctx->argv[5]);
-        if (!next_hop) {
-          ctl_fatal("bad next hop argument: %s", ctx->argv[5]);
-        }
         nbrec_logical_router_policy_set_nexthop(policy, next_hop);
     }
 
@@ -3476,6 +3478,7 @@ static void
 nbctl_lr_policy_del(struct ctl_context *ctx)
 {
     const struct nbrec_logical_router *lr;
+    int64_t priority = 0;
     char *error = lr_by_name_or_uuid(ctx, ctx->argv[1], true, &lr);
     if (error) {
         ctx->error = error;
@@ -3488,7 +3491,11 @@ nbctl_lr_policy_del(struct ctl_context *ctx)
         return;
     }
 
-    int64_t priority = parse_priority(ctx->argv[2]);
+    error = parse_priority(ctx->argv[2], &priority);
+    if (error) {
+        ctx->error = error;
+        return;
+    }
 
     /* If match is not specified, delete all routing policies with the
      * specified priority. */
@@ -3553,7 +3560,7 @@ print_routing_policy(const struct nbrec_logical_router_policy *policy, struct ds
     if (policy->nexthop != NULL) {
         char *next_hop = normalize_prefix_str(policy->nexthop);
         ds_put_format(s, "%10ld %50s %15s %25s", policy->priority, policy->match,
-            policy->action, next_hop);
+                      policy->action, next_hop);
         free(next_hop);
     } else
         ds_put_format(s, "%10ld %50s %15s", policy->priority, policy->match, policy->action);

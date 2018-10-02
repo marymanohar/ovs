@@ -557,10 +557,6 @@ ovsdb_idl_db_clear(struct ovsdb_idl_db *db)
             /* No need to do anything with dst_arcs: some node has those arcs
              * as forward arcs and will destroy them itself. */
 
-            if (!ovs_list_is_empty(&row->track_node)) {
-                ovs_list_remove(&row->track_node);
-            }
-
             ovsdb_idl_row_destroy(row);
         }
     }
@@ -922,6 +918,12 @@ ovsdb_idl_is_alive(const struct ovsdb_idl *idl)
            idl->state != IDL_S_ERROR;
 }
 
+bool
+ovsdb_idl_is_connected(const struct ovsdb_idl *idl)
+{
+    return idl->session && jsonrpc_session_is_connected(idl->session);
+}
+
 /* Returns the last error reported on a connection by 'idl'.  The return value
  * is 0 only if no connection made by 'idl' has ever encountered an error and
  * a negative response to a schema request has never been received. See
@@ -1117,6 +1119,20 @@ ovsdb_idl_db_get_mode(struct ovsdb_idl_db *db,
 }
 
 static void
+ovsdb_idl_db_set_mode(struct ovsdb_idl_db *db,
+                      const struct ovsdb_idl_column *column,
+                      unsigned char mode)
+{
+    const struct ovsdb_idl_table *table = ovsdb_idl_table_from_column(db,
+                                                                      column);
+    size_t column_idx = column - table->class_->columns;
+
+    if (table->modes[column_idx] != mode) {
+        *ovsdb_idl_db_get_mode(db, column) = mode;
+    }
+}
+
+static void
 add_ref_table(struct ovsdb_idl_db *db, const struct ovsdb_base_type *base)
 {
     if (base->type == OVSDB_TYPE_UUID && base->uuid.refTableName) {
@@ -1136,7 +1152,7 @@ static void
 ovsdb_idl_db_add_column(struct ovsdb_idl_db *db,
                         const struct ovsdb_idl_column *column)
 {
-    *ovsdb_idl_db_get_mode(db, column) = OVSDB_IDL_MONITOR | OVSDB_IDL_ALERT;
+    ovsdb_idl_db_set_mode(db, column, OVSDB_IDL_MONITOR | OVSDB_IDL_ALERT);
     add_ref_table(db, &column->type.key);
     add_ref_table(db, &column->type.value);
 }
@@ -2283,6 +2299,24 @@ ovsdb_idl_process_update2(struct ovsdb_idl_table *table,
     return true;
 }
 
+/* Recursively add rows to tracked change lists for current row
+ * and the rows that reference this row. */
+static void
+add_tracked_change_for_references(struct ovsdb_idl_row *row)
+{
+    if (ovs_list_is_empty(&row->track_node) &&
+            ovsdb_idl_track_is_set(row->table)) {
+        ovs_list_push_back(&row->table->track_list,
+                           &row->track_node);
+
+        const struct ovsdb_idl_arc *arc;
+        LIST_FOR_EACH (arc, dst_node, &row->dst_arcs) {
+            add_tracked_change_for_references(arc->src);
+        }
+    }
+}
+
+
 /* Returns true if a column with mode OVSDB_IDL_MODE_RW changed, false
  * otherwise.
  *
@@ -2346,11 +2380,7 @@ ovsdb_idl_row_change__(struct ovsdb_idl_row *row, const struct json *row_json,
                         = row->table->change_seqno[change]
                         = row->table->db->change_seqno + 1;
                     if (table->modes[column_idx] & OVSDB_IDL_TRACK) {
-                        if (!ovs_list_is_empty(&row->track_node)) {
-                            ovs_list_remove(&row->track_node);
-                        }
-                        ovs_list_push_back(&row->table->track_list,
-                                       &row->track_node);
+                        add_tracked_change_for_references(row);
                         if (!row->updated) {
                             row->updated = bitmap_allocate(class->n_columns);
                         }
@@ -2814,9 +2844,7 @@ ovsdb_idl_row_clear_arcs(struct ovsdb_idl_row *row, bool destroy_dsts)
     struct ovsdb_idl_arc *arc, *next;
 
     /* Delete all forward arcs.  If 'destroy_dsts', destroy any orphaned rows
-     * that this causes to be unreferenced, if tracking is not enabled.
-     * If tracking is enabled, orphaned nodes are removed from hmap but not
-     * freed.
+     * that this causes to be unreferenced.
      */
     LIST_FOR_EACH_SAFE (arc, next, src_node, &row->src_arcs) {
         ovs_list_remove(&arc->dst_node);
@@ -2894,10 +2922,9 @@ ovsdb_idl_row_destroy(struct ovsdb_idl_row *row)
                 = row->table->change_seqno[OVSDB_IDL_CHANGE_DELETE]
                 = row->table->db->change_seqno + 1;
         }
-        if (!ovs_list_is_empty(&row->track_node)) {
-            ovs_list_remove(&row->track_node);
+        if (ovs_list_is_empty(&row->track_node)) {
+            ovs_list_push_back(&row->table->track_list, &row->track_node);
         }
-        ovs_list_push_back(&row->table->track_list, &row->track_node);
     }
 }
 
@@ -3020,11 +3047,13 @@ ovsdb_idl_modify_row_by_diff(struct ovsdb_idl_row *row,
 {
     bool changed;
 
+    ovsdb_idl_remove_from_indexes(row);
     ovsdb_idl_row_unparse(row);
     ovsdb_idl_row_clear_arcs(row, true);
     changed = ovsdb_idl_row_apply_diff(row, diff_json,
                                        OVSDB_IDL_CHANGE_MODIFY);
     ovsdb_idl_row_parse(row);
+    ovsdb_idl_add_to_indexes(row);
 
     return changed;
 }
@@ -3486,9 +3515,18 @@ ovsdb_idl_txn_disassemble(struct ovsdb_idl_txn *txn)
     txn->db->txn = NULL;
 
     HMAP_FOR_EACH_SAFE (row, next, txn_node, &txn->txn_rows) {
+        enum { INSERTED, MODIFIED, DELETED } op
+            = (!row->new_datum ? DELETED
+               : !row->old_datum ? INSERTED
+               : MODIFIED);
+
+        if (op != DELETED) {
+            ovsdb_idl_remove_from_indexes(row);
+        }
+
         ovsdb_idl_destroy_all_map_op_lists(row);
         ovsdb_idl_destroy_all_set_op_lists(row);
-        if (row->old_datum) {
+        if (op != INSERTED) {
             if (row->written) {
                 ovsdb_idl_row_unparse(row);
                 ovsdb_idl_row_clear_arcs(row, false);
@@ -3507,7 +3545,9 @@ ovsdb_idl_txn_disassemble(struct ovsdb_idl_txn *txn)
 
         hmap_remove(&txn->txn_rows, &row->txn_node);
         hmap_node_nullify(&row->txn_node);
-        if (!row->old_datum) {
+        if (op != INSERTED) {
+            ovsdb_idl_add_to_indexes(row);
+        } else {
             hmap_remove(&row->table->rows, &row->hmap_node);
             free(row);
         }
@@ -4187,6 +4227,10 @@ ovsdb_idl_txn_write__(const struct ovsdb_idl_row *row_,
         goto discard_datum;
     }
 
+    bool index_row = is_index_row(row);
+    if (!index_row) {
+        ovsdb_idl_remove_from_indexes(row);
+    }
     if (hmap_node_is_null(&row->txn_node)) {
         hmap_insert(&row->table->db->txn->txn_rows, &row->txn_node,
                     uuid_hash(&row->uuid));
@@ -4209,6 +4253,9 @@ ovsdb_idl_txn_write__(const struct ovsdb_idl_row *row_,
     }
     (column->unparse)(row);
     (column->parse)(row, &row->new_datum[column_idx]);
+    if (!index_row) {
+        ovsdb_idl_add_to_indexes(row);
+    }
     return;
 
 discard_datum:
@@ -4336,6 +4383,8 @@ ovsdb_idl_txn_delete(const struct ovsdb_idl_row *row_)
     }
 
     ovs_assert(row->new_datum != NULL);
+    ovs_assert(!is_index_row(row_));
+    ovsdb_idl_remove_from_indexes(row_);
     if (!row->old_datum) {
         ovsdb_idl_row_unparse(row);
         ovsdb_idl_row_clear_new(row);
@@ -4383,6 +4432,7 @@ ovsdb_idl_txn_insert(struct ovsdb_idl_txn *txn,
     row->new_datum = xmalloc(class->n_columns * sizeof *row->new_datum);
     hmap_insert(&row->table->rows, &row->hmap_node, uuid_hash(&row->uuid));
     hmap_insert(&txn->txn_rows, &row->txn_node, uuid_hash(&row->uuid));
+    ovsdb_idl_add_to_indexes(row);
     return row;
 }
 

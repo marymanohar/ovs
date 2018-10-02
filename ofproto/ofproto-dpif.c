@@ -1520,6 +1520,7 @@ add_internal_flows(struct ofproto_dpif *ofproto)
     controller->max_len = UINT16_MAX;
     controller->controller_id = 0;
     controller->reason = OFPR_IMPLICIT_MISS;
+    controller->meter_id = NX_CTLR_NO_METER;
     ofpact_finish_CONTROLLER(&ofpacts, &controller);
 
     error = add_internal_miss_flow(ofproto, id++, &ofpacts,
@@ -3686,7 +3687,7 @@ port_add(struct ofproto *ofproto_, struct netdev *netdev)
 
     odp_port_t port_no = ODPP_NONE;
     int error = dpif_port_add(ofproto->backer->dpif, netdev, &port_no);
-    if (error != EEXIST) {
+    if (error != EEXIST && error != EBUSY) {
         if (error) {
             return error;
         }
@@ -5050,17 +5051,28 @@ nxt_resume(struct ofproto *ofproto_,
            const struct ofputil_packet_in_private *pin)
 {
     struct ofproto_dpif *ofproto = ofproto_dpif_cast(ofproto_);
+    struct dpif_flow_stats stats;
+    struct xlate_cache xcache;
+    struct flow flow;
+    xlate_cache_init(&xcache);
 
     /* Translate pin into datapath actions. */
     uint64_t odp_actions_stub[1024 / 8];
     struct ofpbuf odp_actions = OFPBUF_STUB_INITIALIZER(odp_actions_stub);
     enum slow_path_reason slow;
-    enum ofperr error = xlate_resume(ofproto, pin, &odp_actions, &slow);
+    enum ofperr error = xlate_resume(ofproto, pin, &odp_actions, &slow,
+                                     &flow, &xcache);
 
     /* Steal 'pin->packet' and put it into a dp_packet. */
     struct dp_packet packet;
     dp_packet_init(&packet, pin->base.packet_len);
     dp_packet_put(&packet, pin->base.packet, pin->base.packet_len);
+
+    /* Run the side effects from the xcache. */
+    dpif_flow_stats_extract(&flow, &packet, time_msec(), &stats);
+    ovs_mutex_lock(&ofproto_mutex);
+    ofproto_dpif_xcache_execute(ofproto, &xcache, &stats);
+    ovs_mutex_unlock(&ofproto_mutex);
 
     pkt_metadata_from_flow(&packet.md, &pin->base.flow_metadata.flow);
 
@@ -5813,7 +5825,8 @@ ofproto_unixctl_init(void)
                              NULL);
     unixctl_command_register("dpif/show-dp-features", "bridge", 1, 1,
                              ofproto_unixctl_dpif_show_dp_features, NULL);
-    unixctl_command_register("dpif/dump-flows", "[-m] [--names | --no-nmaes] bridge", 1, INT_MAX,
+    unixctl_command_register("dpif/dump-flows",
+                             "[-m] [--names | --no-names] bridge", 1, INT_MAX,
                              ofproto_unixctl_dpif_dump_flows, NULL);
     unixctl_command_register("dpif/set-dp-features", "bridge", 1, 3 ,
                              ofproto_unixctl_dpif_set_dp_features, NULL);
@@ -5957,7 +5970,7 @@ meter_set(struct ofproto *ofproto_, ofproto_meter_id *meter_id,
         }
     }
 
-    switch (dpif_meter_set(ofproto->backer->dpif, meter_id, config)) {
+    switch (dpif_meter_set(ofproto->backer->dpif, *meter_id, config)) {
     case 0:
         return 0;
     case EFBIG: /* meter_id out of range */

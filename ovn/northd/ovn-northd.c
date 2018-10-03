@@ -4642,6 +4642,8 @@ get_outport_for_routing_policy_nexthop(struct ovn_datapath *od,
        lrp_addr_s = find_lrp_member_ip(out_port, nexthop);
        if (lrp_addr_s) {
             break;
+       } else {
+           out_port = NULL;
        }
     }
     if (!out_port) {
@@ -4659,8 +4661,6 @@ build_routing_policy_flow(struct hmap *lflows, struct ovn_datapath *od,
                           struct hmap *ports,
                           const struct nbrec_logical_router_policy *rule)
 {
-    VLOG_INFO("in build_routing_policy_flow, priority %ld match %s action %s",
-        rule->priority, rule->match, rule->action);
     struct ds match = DS_EMPTY_INITIALIZER;
     struct ds actions = DS_EMPTY_INITIALIZER;
 
@@ -4668,7 +4668,7 @@ build_routing_policy_flow(struct hmap *lflows, struct ovn_datapath *od,
         struct ovn_port *out_port = NULL;
         const char *lrp_addr_s = NULL;
         out_port = get_outport_for_routing_policy_nexthop(
-                       od, ports, rule->priority, rule->nexthop);
+            od, ports, rule->priority, rule->nexthop);
         if (out_port == NULL) {
            return;
         } else {
@@ -4701,7 +4701,7 @@ build_routing_policy_flow(struct hmap *lflows, struct ovn_datapath *od,
     ds_put_format(&match, "%s", rule->match);
 
     ovn_lflow_add(lflows, od, S_ROUTER_IN_POLICY, rule->priority,
-                      ds_cstr(&match), ds_cstr(&actions));
+                  ds_cstr(&match), ds_cstr(&actions));
     ds_destroy(&match);
     ds_destroy(&actions);
 }

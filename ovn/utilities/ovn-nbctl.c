@@ -3441,7 +3441,7 @@ nbctl_lr_policy_add(struct ctl_context *ctx)
         if ((policy->priority == priority) &&
             (!strcmp(policy->match, ctx->argv[3]))) {
            ctl_error(ctx, "Same routing policy already existed on the "
-                       " logical router %s.", ctx->argv[1]);
+                       "logical router %s.", ctx->argv[1]);
         }
     }
 
